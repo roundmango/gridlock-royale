@@ -7066,19 +7066,21 @@ H.pump = function () {
   if (this.lastPump == null) this.lastPump = now;
   let el = (now - this.lastPump) / 1000;
   this.lastPump = now;
-  if (el > 0.25) el = 0.25;
+  // a throttled background tab gets about one timer call per second: catch up so the match stays real-time
+  if (el > 1.2) el = 1.2;
   this.acc += el;
   const dt = D.TICK;
-  let n = 0;
-  while (this.acc >= dt && n < 8) {
+  let n = 0, due = false;
+  while (this.acc >= dt && n < 40) {
     this.acc -= dt; n++;
     this.readClients();
     const lc = this.localClient;
     if (lc && lc.slot >= 0) { const st = lc.getState(); if (st) this.sim.applyClientState(lc.slot, st); }
     this.sim.step(dt);
     this.snapAcc += dt;
-    if (this.snapAcc >= 1 / D.SNAP_HZ - 1e-6) { this.snapAcc = 0; this.broadcast(); }
+    if (this.snapAcc >= 1 / D.SNAP_HZ - 1e-6) { this.snapAcc = 0; due = true; if (n <= 2) { this.broadcast(); due = false; } }
   }
+  if (due) this.broadcast();
 };
 H.broadcast = function () {
   const sim = this.sim;
