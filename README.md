@@ -14,7 +14,7 @@ A 25-car, top-down 3D car-combat battle royale that runs in a phone browser.
 
 One player taps **HOST GAME** and shares the 4-letter code. Friends tap **JOIN GAME** and enter it. Bots fill every empty seat up to 25. The host's device runs the match, so the host should keep the game open in the foreground.
 
-Connections are browser-to-browser (WebRTC via the public PeerJS signaling server). Most home and office networks work. Some strict mobile carrier networks block direct connections; switching one player to Wi-Fi usually fixes it.
+Joiners first try a direct browser-to-browser connection (WebRTC via PeerJS, with its TURN relays). If the network blocks that, which is common on cellular, the game falls back to a relay through a public MQTT broker over secure WebSockets, so it works on any network that can load web pages.
 
 ## Controls
 

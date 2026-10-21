@@ -409,6 +409,7 @@ input.code { font-family: var(--f-display); font-size: 34px; letter-spacing: 0.3
 <div id="fps" hidden></div>
 
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.159.0/build/three.min.js"></script>
 <script>
 // ==== core.js
@@ -4236,12 +4237,9 @@ RoomTransport.prototype.close = async function () {
 
 // --- PeerJS (public hosting)
 const ICE = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+  { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
   { urls: 'stun:global.stun.twilio.com:3478' },
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 function PeerTransport() { Base.call(this); this.kind = 'peer'; this.conns = new Map(); }
 PeerTransport.prototype = Object.create(Base.prototype);
@@ -4251,7 +4249,7 @@ PeerTransport.prototype.open = function (code, asHost) {
     let settled = false;
     const fail = (msg) => { if (settled) return; settled = true; try { this.peer && this.peer.destroy(); } catch (e) { /* */ } reject(new Error(msg)); };
     const peer = this.peer = asHost ? new window.Peer(hostId, { debug: 0, config: { iceServers: ICE } }) : new window.Peer({ debug: 0, config: { iceServers: ICE } });
-    const timer = setTimeout(() => fail(asHost ? 'network' : 'notfound'), asHost ? 12000 : 15000);
+    const timer = setTimeout(() => fail(asHost ? 'network' : (this.signaled ? 'blocked' : 'notfound')), asHost ? 12000 : 7000);
     peer.on('error', (err) => {
       const t = err && err.type;
       if (!settled) { clearTimeout(timer); fail(t === 'unavailable-id' ? 'taken' : t === 'peer-unavailable' ? 'notfound' : 'network'); }
@@ -4263,6 +4261,7 @@ PeerTransport.prototype.open = function (code, asHost) {
         clearTimeout(timer); settled = true; resolve(this);
       } else {
         const conn = peer.connect(hostId, { reliable: true, serialization: 'json' });
+        this.signaled = true;
         this.attach(conn, () => { clearTimeout(timer); if (!settled) { settled = true; resolve(this); } });
       }
     });
@@ -4295,6 +4294,184 @@ PeerTransport.prototype.setPresence = function (patch) {
   for (const c of this.conns.values()) { try { if (c.open) c.send({ p: patch }); } catch (e) { /* */ } }
 };
 PeerTransport.prototype.close = async function () { this.closed = true; try { this.peer && this.peer.destroy(); } catch (e) { /* */ } };
+
+// --- MQTT relay over secure WebSockets (works on any network that can load web pages)
+const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
+N.brokers = function () {
+  try { const q = new URLSearchParams(location.search).get('broker'); if (q) return [q]; } catch (e) { /* */ }
+  return BROKERS;
+};
+function RelayTransport() { Base.call(this); this.kind = 'relay'; this.selfId = 'r' + Math.random().toString(36).slice(2, 11); this.lastSend = 0; this.sendTimer = null; this.hostId = null; }
+RelayTransport.prototype = Object.create(Base.prototype);
+RelayTransport.prototype.connectAny = function (will) {
+  const brokers = N.brokers();
+  return new Promise((resolve, reject) => {
+    let i = 0;
+    const next = () => {
+      if (this.closed) { reject(new Error('closed')); return; }
+      if (i >= brokers.length) { reject(new Error('network')); return; }
+      const url = brokers[i++];
+      let done = false;
+      let client;
+      try {
+        client = window.mqtt.connect(url, { clientId: 'gr' + this.selfId + Math.random().toString(36).slice(2, 6), clean: true, connectTimeout: 6000, reconnectPeriod: 0, keepalive: 20, will });
+      } catch (e) { next(); return; }
+      const t = setTimeout(() => { if (done) return; done = true; try { client.end(true); } catch (e) { /* */ } next(); }, 7000);
+      client.once('connect', () => { if (done) return; done = true; clearTimeout(t); this.broker = url; resolve(client); });
+      client.once('error', () => { if (done) return; done = true; clearTimeout(t); try { client.end(true); } catch (e) { /* */ } next(); });
+    };
+    next();
+  });
+};
+RelayTransport.prototype.open = async function (code, asHost) {
+  if (!window.mqtt) throw new Error('network');
+  const base = this.base = 'gridlockroyale/v' + N.PROTO + '/' + code.toUpperCase();
+  const mine = base + '/m/' + this.selfId;
+  const will = asHost ? { topic: base + '/host', payload: '', qos: 0, retain: true } : { topic: mine, payload: JSON.stringify({ bye: 1 }), qos: 0, retain: false };
+  const client = this.client = await this.connectAny(will);
+  this.asHost = asHost;
+  let hostAnn = null;
+  client.on('message', (topic, payload) => {
+    if (topic === base + '/host') {
+      let j = null;
+      try { j = payload && payload.length ? JSON.parse(payload.toString()) : null; } catch (e) { j = null; }
+      if (asHost) { if (j && j.id !== this.selfId) hostAnn = j; return; }
+      if (!j) { if (this.hostId) { this.members.delete(this.hostId); this.emitChange(); } return; }
+      hostAnn = j;
+      return;
+    }
+    const pre = base + '/m/';
+    if (topic.indexOf(pre) !== 0) return;
+    const id = topic.slice(pre.length);
+    if (id === this.selfId) return;
+    let msg;
+    try { msg = JSON.parse(payload.toString()); } catch (e) { return; }
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.bye) { if (this.members.delete(id)) this.emitChange(); return; }
+    let m = this.members.get(id);
+    if (!m) { m = { state: {}, t: 0 }; this.members.set(id, m); }
+    if (msg.full) m.state = {};
+    mergePatch(m.state, msg.p || {});
+    m.t = Date.now();
+    if (msg.hello) this.sendNow();
+    this.emitChange();
+  });
+  const sub = (topic) => new Promise((res) => client.subscribe(topic, { qos: 0 }, () => res()));
+  await sub(base + '/host');
+  if (asHost) {
+    await sleep(1500);
+    if (hostAnn && Date.now() - (hostAnn.t || 0) < 25000) { await this.close(); throw new Error('taken'); }
+    const announce = () => { if (!this.closed && client.connected) client.publish(base + '/host', JSON.stringify({ id: this.selfId, t: Date.now() }), { qos: 0, retain: true }); };
+    announce();
+    this.annTimer = setInterval(announce, 10000);
+    client.on('connect', announce);
+    await sub(base + '/m/+');
+  } else {
+    const t0 = Date.now();
+    while (!hostAnn && Date.now() - t0 < 5000) await sleep(100);
+    if (!hostAnn || Date.now() - (hostAnn.t || 0) > 30000) { await this.close(); throw new Error('notfound'); }
+    this.hostId = hostAnn.id;
+    await sub(base + '/m/' + this.hostId);
+    client.publish(mine, JSON.stringify({ hello: 1, p: this.state, full: 1 }), { qos: 0 });
+    const t1 = Date.now();
+    while (!this.hostMember() && Date.now() - t1 < 6000) await sleep(100);
+    if (!this.hostMember()) { await this.close(); throw new Error('notfound'); }
+  }
+  client.options.reconnectPeriod = 2000;
+  // liveness: heartbeat every 2s, drop members silent for 12s
+  this.hb = setInterval(() => {
+    const now = Date.now();
+    if (now - this.lastSend > 1800) this.sendNow();
+    let changed = false;
+    for (const [id, m] of this.members) if (now - m.t > 12000) { this.members.delete(id); changed = true; }
+    if (changed) this.emitChange();
+  }, 1000);
+  return this;
+};
+RelayTransport.prototype.sendNow = function () {
+  if (!this.client || this.closed) return;
+  this.lastSend = Date.now();
+  if (this.sendTimer) { clearTimeout(this.sendTimer); this.sendTimer = null; }
+  try { if (this.client.connected) this.client.publish(this.base + '/m/' + this.selfId, JSON.stringify({ p: this.state, full: 1 }), { qos: 0 }); } catch (e) { /* */ }
+};
+RelayTransport.prototype.setPresence = function (patch) {
+  mergePatch(this.state, patch);
+  const wait = 50 - (Date.now() - this.lastSend);
+  if (wait <= 0) this.sendNow();
+  else if (!this.sendTimer) this.sendTimer = setTimeout(() => this.sendNow(), wait);
+};
+RelayTransport.prototype.close = async function () {
+  if (this.closed) return;
+  this.closed = true;
+  clearInterval(this.hb); clearInterval(this.annTimer); if (this.sendTimer) clearTimeout(this.sendTimer);
+  const c = this.client;
+  if (!c) return;
+  try {
+    if (c.connected) {
+      if (this.asHost) c.publish(this.base + '/host', '', { qos: 0, retain: true });
+      c.publish(this.base + '/m/' + this.selfId, JSON.stringify({ bye: 1 }), { qos: 0 });
+    }
+    setTimeout(() => { try { c.end(false); } catch (e) { /* */ } }, 300);
+  } catch (e) { /* */ }
+};
+
+// --- host on both routes at once; members from either route are merged
+function DualTransport(subs) {
+  Base.call(this);
+  this.kind = 'dual';
+  this.subs = subs;
+  this.selfId = subs[0].selfId;
+  for (const s of subs) s.onChange(() => this.emitChange());
+}
+DualTransport.prototype = Object.create(Base.prototype);
+DualTransport.prototype.peers = function () {
+  const all = new Map();
+  for (const s of this.subs) for (const [id, m] of s.peers()) all.set(id, m);
+  this.members = all;
+  return all;
+};
+DualTransport.prototype.hostMember = function () { this.peers(); return Base.prototype.hostMember.call(this); };
+DualTransport.prototype.setPresence = function (patch) { mergePatch(this.state, patch); for (const s of this.subs) s.setPresence(patch); };
+DualTransport.prototype.close = async function () { this.closed = true; for (const s of this.subs) { try { await s.close(); } catch (e) { /* */ } } };
+
+// --- public strategy: host on WebRTC + relay; joiners try WebRTC first, then the relay
+function PublicTransport(mode) { this.mode = mode || 'auto'; this.kind = 'public'; }
+PublicTransport.prototype.open = async function (code, asHost) {
+  const useP2P = this.mode !== 'relay' && !!(window.Peer && window.RTCPeerConnection);
+  const useRelay = this.mode !== 'peer' && !!window.mqtt;
+  if (asHost) {
+    const tries = [];
+    if (useP2P) tries.push(new PeerTransport().open(code, true).catch((e) => e));
+    if (useRelay) tries.push(new RelayTransport().open(code, true).catch((e) => e));
+    const res = await Promise.all(tries);
+    const ok = res.filter((r) => r && typeof r.setPresence === 'function');
+    const taken = res.some((r) => r instanceof Error && r.message === 'taken');
+    if (taken) { for (const t of ok) await t.close(); throw new Error('taken'); }
+    if (!ok.length) throw new Error('network');
+    return ok.length === 1 ? ok[0] : new DualTransport(ok);
+  }
+  const say = (m) => { try { if (this.onProgress) this.onProgress(m); } catch (e) { /* */ } };
+  let relayT = null, relayP = null;
+  if (useRelay) { relayT = new RelayTransport(); relayP = relayT.open(code, false).then(() => relayT, (e) => e); }
+  let p2pErr = null;
+  if (useP2P) {
+    say('Connecting to game ' + code + '…');
+    const pt = new PeerTransport();
+    try {
+      await pt.open(code, false);
+      if (relayT) { relayP.then((r) => { if (r === relayT) relayT.close(); }); }
+      return pt;
+    } catch (e) { p2pErr = e; try { await pt.close(); } catch (e2) { /* */ } }
+  }
+  if (relayP) {
+    say(p2pErr && p2pErr.message === 'blocked' ? 'This network blocks direct connections. Joining through the relay…' : 'Joining through the relay…');
+    const r = await relayP;
+    if (r === relayT) return relayT;
+    if (r && r.message === 'notfound' && (!p2pErr || p2pErr.message === 'notfound')) throw new Error('notfound');
+    throw new Error(p2pErr && p2pErr.message === 'blocked' ? 'blocked' : (r && r.message) || 'network');
+  }
+  throw p2pErr || new Error('network');
+};
 
 // --- BroadcastChannel (same-browser tabs; dev/testing)
 function LocalTransport() { Base.call(this); this.kind = 'local'; this.selfId = 'L' + Math.random().toString(36).slice(2, 10); }
@@ -4348,11 +4525,14 @@ N.detect = async function (forced) {
     } catch (e) { /* fall through */ }
     return { kind: 'none', make: null, reason: 'room' };
   }
-  if (typeof window !== 'undefined' && window.Peer && window.RTCPeerConnection) return { kind: 'peer', make: () => new PeerTransport() };
+  if (typeof window !== 'undefined' && (window.Peer || window.mqtt) && forced !== 'local') {
+    const mode = forced === 'relay' ? 'relay' : forced === 'peer' ? 'peer' : 'auto';
+    return { kind: 'peer', make: () => new PublicTransport(mode) };
+  }
   if (typeof BroadcastChannel !== 'undefined') return { kind: 'local', make: () => new LocalTransport() };
   return { kind: 'none', make: null };
 };
-N.RoomTransport = RoomTransport; N.PeerTransport = PeerTransport; N.LocalTransport = LocalTransport;
+N.RoomTransport = RoomTransport; N.PeerTransport = PeerTransport; N.LocalTransport = LocalTransport; N.RelayTransport = RelayTransport; N.DualTransport = DualTransport; N.PublicTransport = PublicTransport;
 })(globalThis.GR = globalThis.GR || {});
 
 // ==== render.js
@@ -4372,7 +4552,8 @@ function R(canvas, opts) {
   r.outputColorSpace = THREE.LinearSRGBColorSpace;
   r.setClearColor(0x1d3a52, 1);
   this.scene = new THREE.Scene();
-  this.camera = new THREE.PerspectiveCamera(50, 1, 2, 900);
+  this.camera = new THREE.PerspectiveCamera(50, 1, 6, 800);
+  try { const nq = +new URLSearchParams(location.search).get('near'); if (nq > 0) this.camera.near = nq; } catch (e) { /* */ }
   this.camera.up.set(0, 0, -1);
   this.camera.position.set(0, 120, 0);
   this.camera.lookAt(0, 0, 0);
@@ -4702,6 +4883,12 @@ B.cyl = function (cx, y0, cz, r, h, seg, col, colTop) {
     this.tri(cx, y0 + h, cz, x1, y0 + h, z1, x0, y0 + h, z0, colTop == null ? col : colTop);
   }
 };
+B.disc = function (cx, y, cz, r, seg, col) {
+  for (let i = 0; i < seg; i++) {
+    const a0 = i / seg * U.TAU, a1 = (i + 1) / seg * U.TAU;
+    this.tri(cx, y, cz, cx + Math.cos(a1) * r, y, cz + Math.sin(a1) * r, cx + Math.cos(a0) * r, y, cz + Math.sin(a0) * r, col);
+  }
+};
 B.cone = function (cx, y0, cz, r, h, seg, col) {
   for (let i = 0; i < seg; i++) {
     const a0 = i / seg * U.TAU, a1 = (i + 1) / seg * U.TAU;
@@ -4789,13 +4976,15 @@ P.buildCity = function (map) {
       c += vec3(0.5) * edge * edge * smoothstep(0.92, 1.0, sin((max(abs(vW.x),abs(vW.y)) - time*4.0)*0.6)) * 0.25;
       gl_FragColor = vec4(c, 1.0); }`,
   });
+  seaMat.depthTest = false; seaMat.depthWrite = false;
   const sea = new THREE.Mesh(new THREE.PlaneGeometry(4000, 4000), seaMat);
-  sea.rotation.x = -Math.PI / 2; sea.position.y = -1.2;
+  sea.rotation.x = -Math.PI / 2; sea.position.y = -1.2; sea.renderOrder = -20;
   city.add(sea);
   this.seaMat = seaMat;
 
   // --- ground layers (world-UV tiled)
-  const layers = { concrete: new Builder(), grass: new Builder(), dirt: new Builder(), asphalt: new Builder(), plaza: new Builder(), sand: new Builder() };
+  const layers = { concrete: new Builder(), grass: new Builder(), dirt: new Builder(), asphalt: new Builder(), plaza: new Builder(), sand: new Builder(), paths: new Builder() };
+  const water = new Builder();
   const L = layers;
   // island slab
   L.sand.flat(-S - 8, -S - 8, S + 8, S + 8, -0.02, 0xffffff, 10);
@@ -4839,20 +5028,25 @@ P.buildCity = function (map) {
   // decals: parking stalls, park paths
   for (const d of map.decals) {
     if (d.type === 'stall') { mk.flatRot(d.x - 1.55, d.z + 2.7, 0.15, 5.2, 0, 0.07, WHITE); }
-    else if (d.type === 'path') L.sand.flat(d.x0, d.z0, d.x1, d.z1, 0.06, 0xe8dcc0, 6);
+    else if (d.type === 'path') L.paths.flat(d.x0, d.z0, d.x1, d.z1, 0.06, 0xe8dcc0, 6);
   }
   const groundMats = {
-    concrete: T.concrete, grass: T.grass, dirt: T.dirt, asphalt: T.asphalt, plaza: T.plaza, sand: T.sand,
+    concrete: T.concrete, grass: T.grass, dirt: T.dirt, asphalt: T.asphalt, plaza: T.plaza, sand: T.sand, paths: T.sand,
   };
-  for (const k in layers) {
-    if (!layers[k].count()) continue;
-    const m = new THREE.Mesh(layers[k].geometry(true), new THREE.MeshLambertMaterial({ map: groundMats[k], vertexColors: true }));
-    city.add(m);
-  }
-  const wm = new THREE.Mesh(wallB.geometry(), new THREE.MeshLambertMaterial({ vertexColors: true }));
+  // Flat ground draws bottom-to-top in a fixed order with no depth test or write: no z-fighting on 16-bit depth buffers (common on Android).
+  const GROUND_ORDER = { sand: -18, concrete: -17, grass: -16, dirt: -16, asphalt: -16, plaza: -16, paths: -15 };
+  const groundMesh = (geo, mat, order) => { mat.depthTest = false; mat.depthWrite = false; const m = new THREE.Mesh(geo, mat); m.renderOrder = order; city.add(m); return m; };
+  this.groundLater = () => {
+    for (const k in layers) {
+      if (!layers[k].count()) continue;
+      groundMesh(layers[k].geometry(true), new THREE.MeshLambertMaterial({ map: groundMats[k], vertexColors: true }), GROUND_ORDER[k]);
+    }
+    if (water.count()) groundMesh(water.geometry(), new THREE.MeshLambertMaterial({ vertexColors: true }), -14);
+    groundMesh(mk.geometry(), new THREE.MeshBasicMaterial({ vertexColors: true }), -13);
+  };
+  const wm = new THREE.Mesh(wallB.geometry(), new THREE.MeshLambertMaterial({ vertexColors: true, depthTest: false, depthWrite: false }));
+  wm.renderOrder = -19;
   city.add(wm);
-  const mkm = new THREE.Mesh(mk.geometry(), new THREE.MeshBasicMaterial({ vertexColors: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
-  city.add(mkm);
 
   // --- buildings
   const bb = new Builder();
@@ -4966,15 +5160,13 @@ P.buildCity = function (map) {
         props.cyl(f.x, 1.2, f.z, f.r * 0.25, 1.6, 10, 0xd6cfc2, 0xe0f4ff);
         break;
       case 'pond': {
-        const pb = new Builder();
-        pb.cyl(f.x, 0.04, f.z, f.r, 0.02, 20, 0x2e6f8e, 0x3a86a6);
-        props.cyl(f.x, 0.02, f.z, f.r + 1, 0.03, 20, 0xb9ad8c, 0xb9ad8c);
-        trees.p.push(...pb.p); trees.n.push(...pb.n); trees.c.push(...pb.c); trees.u.push(...pb.u); trees.t.push(...pb.t);
+        L.paths.disc(f.x, 0.06, f.z, f.r + 1, 24, 0xb9ad8c);
+        water.disc(f.x, 0.07, f.z, f.r, 24, 0x3a86a6);
         break;
       }
       case 'canopy': {
         for (const o of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) props.box(f.x + o[0] * (f.w / 2 - 1.5), 0, f.z + o[1] * (f.h / 2 - 1.5), 0.6, 6, 0.6, 0xdddddd);
-        bb.quad([f.x - f.w / 2, 6.6, f.z + f.h / 2], [f.x + f.w / 2, 6.6, f.z + f.h / 2], [f.x + f.w / 2, 6.6, f.z - f.h / 2], [f.x - f.w / 2, 6.6, f.z - f.h / 2], 0xffffff, [0, 1, 1, 1, 1, 0, 0, 0], 30);
+        bb.quad([f.x - f.w / 2, 6.7, f.z + f.h / 2], [f.x + f.w / 2, 6.7, f.z + f.h / 2], [f.x + f.w / 2, 6.7, f.z - f.h / 2], [f.x - f.w / 2, 6.7, f.z - f.h / 2], 0xffffff, [0, 1, 1, 1, 1, 0, 0, 0], 30);
         props.box(f.x, 6.0, f.z, f.w, 0.6, f.h, 0xd42e2e, 0, 0xd42e2e);
         break;
       }
@@ -5002,10 +5194,11 @@ P.buildCity = function (map) {
   }
   if (rampB.count()) city.add(new THREE.Mesh(rampB.geometry(true), new THREE.MeshLambertMaterial({ map: T.stripes, vertexColors: true })));
   city.add(new THREE.Mesh(bb.geometry(true, true), bmat));
-  const shMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.32, depthWrite: true, depthFunc: THREE.LessDepth });
+  const shMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.3, depthWrite: false });
   const shm = new THREE.Mesh(sh.geometry(), shMat);
   shm.renderOrder = 1;
   city.add(shm);
+  this.groundLater();
   const pm = new THREE.Mesh(props.geometry(), new THREE.MeshLambertMaterial({ vertexColors: true }));
   city.add(pm);
   city.add(new THREE.Mesh(trees.geometry(), new THREE.MeshLambertMaterial({ vertexColors: true })));
@@ -5015,6 +5208,7 @@ P.buildCity = function (map) {
     const m = new THREE.Mesh(new THREE.PlaneGeometry(s.w * 0.8, s.h * 0.9), new THREE.MeshBasicMaterial({ map: T.chevron, transparent: true, opacity: 0.85, color: 0x46ff8a, depthWrite: false }));
     m.rotation.x = -Math.PI / 2;
     m.position.set(s.x, 0.12, s.z);
+    m.renderOrder = 3;
     city.add(m);
     this.sprayMarkers.push(m);
   }
@@ -5123,10 +5317,10 @@ function wheels(b, L, W, r, w, lift, col, inset) {
   for (const x of xs) for (const z of [W / 2 - (inset || 0.1), -W / 2 + (inset || 0.1)]) b.box(x, lift || 0, z, r * 2, r * 2, w, col || 0x161616, 0, 0x2a2a2a);
 }
 function lights(b, L, W, y, front, rear) {
-  b.box(L / 2 - 0.05, y, W * 0.32, 0.12, 0.22, 0.42, front || 0xfff6cc);
-  b.box(L / 2 - 0.05, y, -W * 0.32, 0.12, 0.22, 0.42, front || 0xfff6cc);
-  b.box(-L / 2 + 0.05, y, W * 0.34, 0.12, 0.22, 0.4, rear || 0xd61f1f);
-  b.box(-L / 2 + 0.05, y, -W * 0.34, 0.12, 0.22, 0.4, rear || 0xd61f1f);
+  b.box(L / 2 + 0.03, y, W * 0.32, 0.14, 0.22, 0.42, front || 0xfff6cc);
+  b.box(L / 2 + 0.03, y, -W * 0.32, 0.14, 0.22, 0.42, front || 0xfff6cc);
+  b.box(-L / 2 - 0.03, y, W * 0.34, 0.14, 0.22, 0.4, rear || 0xd61f1f);
+  b.box(-L / 2 - 0.03, y, -W * 0.34, 0.14, 0.22, 0.4, rear || 0xd61f1f);
 }
 function sedan(b, o) {
   const L = o.L, W = o.W, col = o.col;
@@ -5141,7 +5335,7 @@ const MODELS = {};
 MODELS.vandal = (b, col, trim) => {
   sedan(b, { L: 4.8, W: 2.3, col, cabL: 2.0, cabX: -0.5, cabH: 0.55 });
   b.box(1.25, 0.95, 0, 0.9, 0.2, 0.7, trim, 0, 0x2b2b2b);
-  for (const z of [-0.3, 0.3]) { b.box(1.2, 0.945, z, 2.3, 0.02, 0.22, trim); b.box(-0.55, 1.5, z, 1.4, 0.02, 0.22, trim); b.box(-2.0, 0.945, z, 0.75, 0.02, 0.22, trim); }
+  for (const z of [-0.3, 0.3]) { b.box(1.2, 0.94, z, 2.3, 0.07, 0.22, trim); b.box(-0.55, 1.49, z, 1.4, 0.07, 0.22, trim); b.box(-2.0, 0.94, z, 0.75, 0.07, 0.22, trim); }
   b.box(-2.3, 0.94, 0, 0.3, 0.35, 2.1, 0x222222);
 };
 MODELS.brickhouse = (b, col, trim) => {
@@ -5150,7 +5344,7 @@ MODELS.brickhouse = (b, col, trim) => {
   b.box(1.9, 1.45, 0, 2.2, 1.1, W * 0.92, 0x2a3138, 0, mulCol(col, 1.1), [0.85, 0.95, -0.1]);
   b.box(-1.1, 1.45, 0, 3.8, 1.3, W * 0.98, col, 0, mulCol(col, 1.12));
   b.box(-1.1, 2.75, 0, 1.2, 0.35, 1.2, trim, 0, 0x3c4434);
-  for (let k = 0; k < 4; k++) b.box(-2.6 + k * 1.0, 2.76, 0, 0.6, 0.04, W * 0.9, mulCol(col, 0.85));
+  for (let k = 0; k < 4; k++) b.box(-2.6 + k * 1.0, 2.75, 0, 0.6, 0.08, W * 0.9, mulCol(col, 0.85));
   b.box(L / 2 + 0.1, 0.4, 0, 0.35, 0.6, W, 0x2a2a2a);
   wheels(b, L, W + 0.15, 0.48, 0.55, 0);
   lights(b, L, W, 0.8);
@@ -5161,7 +5355,7 @@ MODELS.stomper = (b, col, trim) => {
   b.box(0, lift, 0, L * 0.9, 0.7, W * 0.72, col, 0, mulCol(col, 1.1));
   b.box(0.2, lift + 0.7, 0, 1.9, 0.75, W * 0.66, 0x1d2731, 0, mulCol(col, 1.05), [0.8, 0.9, -0.1]);
   b.box(-1.5, lift + 0.7, 0, 1.6, 0.25, W * 0.7, mulCol(col, 0.8));
-  for (const z of [-0.45, 0.45]) b.box(1.6, lift + 0.71, z, 1.1, 0.02, 0.28, 0xffb02e);
+  for (const z of [-0.45, 0.45]) b.box(1.6, lift + 0.7, z, 1.1, 0.07, 0.28, 0xffb02e);
   b.box(0.2, lift + 1.46, 0, 0.3, 0.2, W * 0.66, 0xffd23f);
   lights(b, L * 0.9, W * 0.72, lift + 0.3);
 };
@@ -5171,7 +5365,7 @@ MODELS.wraith = (b, col, trim) => {
   b.box(-0.2, 0.75, 0, 1.9, 0.42, W * 0.7, 0x111820, 0, 0x1a2633, [0.6, 0.8, -0.2]);
   b.box(-2.05, 0.75, 0, 0.4, 0.15, W * 1.0, trim, 0, trim);
   for (const z of [-0.85, 0.85]) b.box(-2.05, 0.75, z, 0.25, 0.35, 0.12, trim);
-  b.box(1.4, 0.751, 0, 1.4, 0.02, 0.5, trim);
+  b.box(1.4, 0.75, 0, 1.4, 0.07, 0.5, trim);
   wheels(b, L, W + 0.1, 0.33, 0.45, 0);
   lights(b, L, W, 0.4, 0xd9f2ff);
 };
@@ -5180,8 +5374,8 @@ MODELS.brainfreeze = (b, col, trim) => {
   b.box(0, 0.35, 0, L, 0.7, W, col, 0, col);
   b.box(1.9, 1.05, 0, 1.6, 0.85, W * 0.95, 0x22303c, 0, 0xf6f6f6, [0.8, 0.95, -0.1]);
   b.box(-0.8, 1.05, 0, 3.8, 1.55, W, col, 0, 0xf6f6f6);
-  b.box(-0.8, 1.4, W / 2 + 0.01, 3.0, 0.7, 0.02, trim);
-  b.box(-0.8, 1.4, -W / 2 - 0.01, 3.0, 0.7, 0.02, trim);
+  b.box(-0.8, 1.4, W / 2 + 0.035, 3.0, 0.7, 0.07, trim);
+  b.box(-0.8, 1.4, -W / 2 - 0.035, 3.0, 0.7, 0.07, trim);
   b.cone(-0.8, 2.6, 0, 0.55, -0.01, 8, 0xd9a35a);
   b.cone(-0.8, 3.75, 0, 0.55, -1.15, 8, 0xd9a35a);
   b.ico(-0.8, 3.95, 0, 0.62, trim);
@@ -5193,14 +5387,14 @@ MODELS.lastride = (b, col, trim) => {
   const L = 5.8, W = 2.3;
   b.box(0, 0.32, 0, L, 0.6, W, col, 0, mulCol(col, 1.25));
   b.box(-0.55, 0.92, 0, 3.9, 0.75, W * 0.88, 0x3b2440, 0, mulCol(col, 1.35), [0.95, 0.97, -0.05]);
-  for (const z of [-1.02, 1.02]) b.box(-1.5, 1.05, z, 1.8, 0.35, 0.03, 0xbfbac6);
-  b.box(-0.55, 1.68, 0, 3.0, 0.05, 0.25, 0xbfbac6);
+  for (const z of [-1.05, 1.05]) b.box(-1.5, 1.05, z, 1.8, 0.35, 0.07, 0xbfbac6);
+  b.box(-0.55, 1.67, 0, 3.0, 0.08, 0.25, 0xbfbac6);
   wheels(b, L, W + 0.12, 0.36, 0.42, 0);
   lights(b, L, W, 0.5, 0xfff2d0, 0x8a1fd6);
 };
 MODELS.hotpursuit = (b, col, trim) => {
   sedan(b, { L: 4.9, W: 2.3, col, roof: 0xf4f4f4 });
-  for (const z of [-1.16, 1.16]) b.box(-0.2, 0.42, z, 1.8, 0.44, 0.02, 0xf4f4f4);
+  for (const z of [-1.18, 1.18]) b.box(-0.2, 0.42, z, 1.8, 0.44, 0.07, 0xf4f4f4);
   b.box(-0.35, 1.53, 0, 0.42, 0.2, 1.6, 0x333333);
   b.box(-0.35, 1.6, 0.5, 0.36, 0.16, 0.5, 0xff2a2a);
   b.box(-0.35, 1.6, -0.5, 0.36, 0.16, 0.5, 0x2a5bff);
@@ -5208,8 +5402,8 @@ MODELS.hotpursuit = (b, col, trim) => {
 };
 MODELS.cop = (b) => {
   sedan(b, { L: 4.9, W: 2.3, col: 0xf2f2f2, roof: 0xf7f7f7 });
-  b.box(1.65, 0.945, 0, 1.6, 0.02, 2.25, 0x161616);
-  b.box(-1.95, 0.945, 0, 1.0, 0.02, 2.25, 0x161616);
+  b.box(1.65, 0.94, 0, 1.6, 0.07, 2.25, 0x161616);
+  b.box(-1.95, 0.94, 0, 1.0, 0.07, 2.25, 0x161616);
   b.box(-0.35, 1.53, 0, 0.42, 0.18, 1.6, 0x2b2b2b);
   b.box(2.45, 0.35, 0, 0.3, 0.5, 2.0, 0x1b1b1b);
 };
@@ -5218,14 +5412,14 @@ MODELS.swat = (b) => {
   b.box(0, 0.4, 0, L, 0.8, W, 0x1f2328, 0, 0x2a2e33);
   b.box(2.0, 1.2, 0, 1.6, 0.9, W * 0.95, 0x141a20, 0, 0x2a2e33, [0.82, 0.95, -0.1]);
   b.box(-0.9, 1.2, 0, 3.8, 1.5, W, 0x23272c, 0, 0x30353b);
-  b.box(-0.9, 2.71, 0, 2.2, 0.03, 1.6, 0xd9d9d9);
-  b.box(1.0, 2.71, 0, 0.42, 0.18, 1.6, 0x2b2b2b);
+  b.box(-0.9, 2.7, 0, 2.2, 0.07, 1.6, 0xd9d9d9);
+  b.box(1.0, 2.7, 0, 0.42, 0.18, 1.6, 0x2b2b2b);
   wheels(b, L, W + 0.14, 0.45, 0.5, 0);
   lights(b, L, W, 0.7);
 };
 MODELS.fbi = (b) => {
   sedan(b, { L: 5.2, W: 2.4, col: 0x111114, roof: 0x18181c, bodyH: 0.85, cabL: 3.2, cabX: -0.4, cabH: 0.75, glass: 0x05070a });
-  b.box(2.55, 0.5, 0, 0.12, 0.2, 1.2, 0x2a5bff);
+  b.box(2.64, 0.5, 0, 0.14, 0.2, 1.2, 0x2a5bff);
 };
 MODELS.jeep = (b) => {
   const L = 5.0, W = 2.6;
@@ -5235,7 +5429,7 @@ MODELS.jeep = (b) => {
   b.box(-0.5, 2.25, 0, 0.15, 0.12, 2.35, 0x2a2a2a);
   b.box(-1.2, 1.2, 0, 1.0, 0.5, 1.0, 0x3a4229);
   b.box(-0.6, 1.8, 0, 1.8, 0.18, 0.18, 0x1a1a1a);
-  b.box(1.9, 1.21, 0, 1.0, 0.02, 0.8, 0xe9e9d8);
+  b.box(1.9, 1.2, 0, 1.0, 0.07, 0.8, 0xe9e9d8);
   wheels(b, L, W + 0.2, 0.48, 0.55, 0);
   lights(b, L, W, 0.6);
 };
@@ -5258,8 +5452,8 @@ MODELS.heli = (b, col, trim) => {
   b.box(-5.2, -0.4, 0, 0.6, 1.4, 0.15, trim);
   for (const z of [-1.2, 1.2]) b.box(0.4, -1.6, z, 3.6, 0.15, 0.15, 0x333333);
   b.box(0.4, 0.0, 0, 0.6, 0.35, 0.6, 0x333333);
-  b.box(0.6, -0.89, 1.11, 2.2, 0.4, 0.02, trim);
-  b.box(0.6, -0.89, -1.11, 2.2, 0.4, 0.02, trim);
+  b.box(0.6, -0.89, 1.15, 2.2, 0.4, 0.07, trim);
+  b.box(0.6, -0.89, -1.15, 2.2, 0.4, 0.07, trim);
 };
 MODELS.apache = (b, col, trim) => {
   b.box(0.4, -0.9, 0, 5.0, 1.4, 1.5, col, 0, mulCol(col, 1.12), [0.8, 0.8, 0.2]);
@@ -5276,7 +5470,7 @@ MODELS.rotor = (b) => {
   b.box(0, 0, 0, 0.5, 0.08, 12.5, 0x202020);
 };
 MODELS.traffic = (b, col) => { sedan(b, { L: 4.6, W: 2.2, col }); };
-MODELS.taxi = (b, col) => { sedan(b, { L: 4.6, W: 2.2, col: 0xf2c230 }); b.box(-0.3, 1.52, 0, 0.5, 0.3, 1.0, 0xffffff, 0, 0xffe680); for (const z of [-1.11, 1.11]) for (let k = 0; k < 6; k++) b.box(-1.0 + k * 0.4, 0.62, z, 0.2, 0.2, 0.02, k % 2 ? 0x111111 : 0xffffff); };
+MODELS.taxi = (b, col) => { sedan(b, { L: 4.6, W: 2.2, col: 0xf2c230 }); b.box(-0.3, 1.52, 0, 0.5, 0.3, 1.0, 0xffffff, 0, 0xffe680); for (const z of [-1.135, 1.135]) for (let k = 0; k < 6; k++) b.box(-1.0 + k * 0.4, 0.62, z, 0.2, 0.2, 0.07, k % 2 ? 0x111111 : 0xffffff); };
 MODELS.bus = (b) => {
   const L = 9.5, W = 2.9;
   b.box(0, 0.35, 0, L, 1.2, W, 0xf2b134, 0, 0xf2b134);
@@ -5551,12 +5745,12 @@ P.updateStorm = function (s, dt) {
 const PK = D.PK;
 P.initPickups = function () {
   const mk = (fn) => { const b = new Builder(); fn(b); return b.geometry(); };
-  const crate = mk((b) => { b.box(0, -1, 0, 2.2, 2.0, 2.2, 0xffffff, 0, 0xffffff); for (const z of [-0.7, 0.7]) b.box(0, -1.02, z, 2.25, 2.05, 0.25, 0x333333, 0, 0x333333); b.box(0, 1.0, 0, 0.9, 0.06, 0.9, 0x111111); });
+  const crate = mk((b) => { b.box(0, -1, 0, 2.2, 2.0, 2.2, 0xffffff, 0, 0xffffff); for (const z of [-0.7, 0.7]) b.box(0, -1.06, z, 2.32, 2.13, 0.25, 0x333333, 0, 0x333333); b.box(0, 1.0, 0, 0.9, 0.16, 0.9, 0x111111); });
   const repair = mk((b) => { b.box(0, -1, 0, 2.2, 2.0, 2.2, 0x2fb85a, 0, 0x3fd06c); b.box(0, 1.0, 0, 1.5, 0.08, 0.45, 0xffffff); b.box(0, 1.0, 0, 0.45, 0.08, 1.5, 0xffffff); });
   const nitro = mk((b) => { b.cyl(0, -1, 0, 0.75, 2.2, 10, 0x2a7bff, 0x6fb2ff); b.cyl(0, 1.2, 0, 0.3, 0.4, 8, 0xdddddd); b.box(0, -0.2, 0.74, 0.8, 0.8, 0.05, 0xffffff); });
   const upgrade = mk((b) => { b.box(0, -1, 0, 2.2, 2.0, 2.2, 0xf2c230, 0, 0xffd95a); for (let k = 0; k < 8; k++) { const a = k / 8 * U.TAU; b.box(Math.cos(a) * 0.55, 1.0, Math.sin(a) * 0.55, 0.35, 0.12, 0.35, 0x8a6a10, a); } b.cyl(0, 1.0, 0, 0.45, 0.13, 10, 0x8a6a10, 0xb08a20); });
-  const bribe = mk((b) => { for (let k = 0; k < 3; k++) b.box(0, -1 + k * 0.5, 0, 2.2, 0.45, 1.2, 0x3c9a4a, 0, 0x5cb86a); b.box(0, -1.02, 0, 0.5, 1.55, 1.25, 0xf4f1e0); });
-  const air = mk((b) => { b.box(0, -1.4, 0, 3.4, 2.8, 3.4, 0x4a5a3a, 0, 0x5a6a46); for (const o of [-1.2, 1.2]) b.box(o, -1.42, 0, 0.3, 2.85, 3.45, 0xd9ff3d); });
+  const bribe = mk((b) => { for (let k = 0; k < 3; k++) b.box(0, -1 + k * 0.5, 0, 2.2, 0.45, 1.2, 0x3c9a4a, 0, 0x5cb86a); b.box(0, -1.04, 0, 0.5, 1.6, 1.32, 0xf4f1e0); });
+  const air = mk((b) => { b.box(0, -1.4, 0, 3.4, 2.8, 3.4, 0x4a5a3a, 0, 0x5a6a46); for (const o of [-1.2, 1.2]) b.box(o, -1.46, 0, 0.3, 2.93, 3.54, 0xd9ff3d); });
   this.pickGeo = { crate, repair, nitro, upgrade, bribe, air };
   const n = Math.max(1, (this.map && this.map.pickups.length) || 200);
   this.pickInst = {};
@@ -5980,9 +6174,9 @@ P.makeHazard = function (h) {
     }
     case 'fire': {
       const mat = this.glowMat(0xff5a1f, 0.6); mat.map = this.tex.blob;
-      const m = new THREE.Mesh(this.geo.disc, mat); m.position.y = 0.14; o.add(m); ud.mat = mat;
+      const m = new THREE.Mesh(this.geo.disc, mat); m.position.y = 0.14; m.renderOrder = 3; o.add(m); ud.mat = mat;
       const sc = new THREE.Mesh(this.geo.disc, new THREE.MeshBasicMaterial({ color: 0x000000, map: this.tex.scorch, transparent: true, opacity: 0.6, depthWrite: false }));
-      sc.position.y = 0.12; o.add(sc);
+      sc.position.y = 0.12; sc.renderOrder = 2; o.add(sc);
       break;
     }
     case 'spikes': {
@@ -6078,7 +6272,7 @@ P.ring = function (x, z, r, col, life) {
 };
 P.scorch = function (x, z, r) {
   let s = this.scorches.length > 36 ? this.scorches.shift() : null;
-  if (!s) { s = { m: new THREE.Mesh(this.geo.disc, new THREE.MeshBasicMaterial({ color: 0x000000, map: this.tex.scorch, transparent: true, opacity: 0.85, depthWrite: false })) }; s.m.renderOrder = 2; this.dyn.add(s.m); }
+  if (!s) { s = { m: new THREE.Mesh(this.geo.disc, new THREE.MeshBasicMaterial({ color: 0x000000, map: this.tex.scorch, transparent: true, opacity: 0.85, depthWrite: false })) }; s.m.renderOrder = 1; this.dyn.add(s.m); }
   s.m.position.set(x, 0.1 + Math.random() * 0.01, z); s.m.rotation.y = Math.random() * 6; s.m.scale.set(r, 1, r); s.t = 0; s.m.material.opacity = 0.85;
   this.scorches.push(s);
 };
@@ -8268,9 +8462,13 @@ const App = G.App = {
     this.joining = true;
     $('jerr').textContent = 'Looking for game ' + code + '…';
     const t = this.net.make();
+    t.onProgress = (m) => { if (this.joining) $('jerr').textContent = m; };
     let tr = null;
     try { tr = await t.open(code, false); } catch (e) {
-      $('jerr').textContent = e.message === 'notfound' ? 'No game with code ' + code + ' is open right now. Check the code with the host.' : 'Could not connect (' + (e.message || 'network') + '). Try again.';
+      const m = e && e.message;
+      $('jerr').textContent = m === 'notfound' ? 'No game with code ' + code + ' is open right now. Check the code with the host, and make sure their game is still on the lobby screen.'
+        : m === 'blocked' ? 'Found the game but this network blocked the connection. Try again, or switch one phone to Wi-Fi.'
+        : 'Could not reach the game servers (' + (m || 'network') + '). Check your connection and try again.';
     }
     this.joining = false;
     if (!tr) return;
